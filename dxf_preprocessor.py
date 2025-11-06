@@ -1,44 +1,55 @@
 from typing import Iterable, Iterator, Tuple, Dict, Set
 import ezdxf
 from ezdxf.addons import importer
+import torch
 
 # a dxf will be exploded into a list of those entities
 PRIMITIVE_TYPES = {
     "LINE", "ARC", "CIRCLE", "ELLIPSE", "SPLINE",
-    "SOLID", "POINT"
+    "SOLID", "POINT", "TEXT", "MTEXT"
 }
 # complex entities are exploded into primitive ones
 COMPLEX_TYPES = {"INSERT", "DIMENSION", "HATCH", "LEADER", "MLEADER", "LWPOLYLINE", "POLYLINE"}
 
+# dict[str: int], where str is the text description of what that argument is (like "x_coord")
+# int is its id, indicative of different embeddings in tokenizenzation process
+ARGUMENT_MAP = {"EMPTY": 0, "X_COORD": 1, "Y_COORD": 2, "RADIUS": 3, "ANGLE": 4, "MAJOR_AXIS": 5, "MINOR_AXIS": 6}
+# same here, text description of primitive type -> id
+PRIMITIVE_MAP = {"ERROR": 0, "LINE": 1, "ARC": 2, "ELLIPSE": 3}
 
 def _split_prims_complex(children):
-    prims, complexes = [], []
+    prims, prims_text, complexes = [], [], []
     for c in children:
         entity_type = c.dxftype()
         if entity_type in PRIMITIVE_TYPES:
-            prims.append(c)
+            if entity_type in ["TEXT", "MTEXT"]:
+                prims_text.append(c)
+            else:
+                prims.append(c)
         else:
             complexes.append(c)
-    return prims, complexes
+    return prims, prims_text, complexes
 
 # for LWPOLYLINE/POLYLINE
 def expand_polyline(pl):
     if not hasattr(pl, "virtual_entities"):
-        return [], []
+        return [], [], []
 
     try:
         segs = list(pl.virtual_entities())
     except Exception:
-        return [], []
+        return [], [], []
     return _split_prims_complex(segs)
 
 # for INSERT
 def expand_insert(ins):
     if not hasattr(ins, "virtual_entities"):
-        return [], []
+        return [], [], []
     return _split_prims_complex(ins.virtual_entities())
 
 # For DIMENSION
+# there are two cases: either a raw dimension, or a dimension that already has an INSERT corresponding to it
+# prefer expanding the INSERT if possible, otherwise generate entities from the dimension itself
 def expand_dimension(msp, dim):
     block_name = getattr(dim.dxf, "geometry", None)
     if block_name is not None:
@@ -56,50 +67,57 @@ def expand_dimension(msp, dim):
             if hasattr(dim, "virtual_entities"):
                 return _split_prims_complex(dim.virtual_entities())
             
-    return [], []
+    return [], [], []
 
 # for HATCH
 def expand_hatch(hatch):
     if hasattr(hatch, "virtual_entities"):
         return _split_prims_complex(hatch.virtual_entities())
-    return [], []
+    return [], [], []
 
 # for LEADER or MLEADER
 def expand_leader_like(entity):
     if hasattr(entity, "virtual_entities"):
         return _split_prims_complex(entity.virtual_entities())
-    return [], []
+    return [], [], []
 
 # recursively expand, until there are no more complex entities
-def expand_entity(msp, entity, out, debug=False):
+def expand_entity(msp, entity, out, out_text, debug=False):
     entity_type = entity.dxftype()
     if entity_type in PRIMITIVE_TYPES:
-        primitives, complexes = [entity], []
+        if entity_type in ["TEXT", "MTEXT"]:
+            primitives, primtives_text, complexes = [], [entity], []
+        else:
+            primitives, primtives_text, complexes = [entity], [], []
     elif entity_type == "DIMENSION":
-        primitives, complexes = expand_dimension(msp, entity)
+        primitives, primtives_text, complexes = expand_dimension(msp, entity)
     elif entity_type == "HATCH":
-        primitives, complexes = expand_hatch(entity)
+        primitives, primtives_text, complexes = expand_hatch(entity)
     elif entity_type == "INSERT":
-        primitives, complexes = expand_insert(entity)
+        primitives, primtives_text, complexes = expand_insert(entity)
     elif entity_type in ["LEADER", "MLEADER"]:
-        primitives, complexes = expand_leader_like(entity)
+        primitives, primtives_text, complexes = expand_leader_like(entity)
     elif entity_type in ["POLYLINE", "LWPOLYLINE"]:
-        primitives, complexes = expand_polyline(entity)
+        primitives, primtives_text, complexes = expand_polyline(entity)
     else:
-        primitives, complexes = [], []
+        primitives, primtives_text, complexes = [], [], []
         if debug:
             print("Unknown dxftype encountered:", entity_type)
 
     out.extend(primitives)
+    out_text.extend(primtives_text)
     for e in complexes:
-        expand_entity(msp, e, out)
+        expand_entity(msp, e, out, out_text)
     
 def convert_to_primitives(doc, debug=False):
     msp = doc.modelspace()
+    # store text and other primitives (line, circle, etc.) separately
+    # they go through different encoding processes
     out = []
+    out_text = []
     for entity in msp:
-        expand_entity(msp, entity, out, debug=debug)
-    return out
+        expand_entity(msp, entity, out, out_text, debug=debug)
+    return out, out_text
 
 # function to verify if the extracted primitives actually make sense
 def write_dxf_from_primitives(primitives, out_path, dxfversion="R2018"):
@@ -124,12 +142,6 @@ def write_dxf_from_primitives(primitives, out_path, dxfversion="R2018"):
     target_doc.saveas(out_path)
     return out_path
 
-# dict[str: int], where str is the text description of what that argument is (like "x_coord")
-# int is its id, indicative of different embeddings in tokenizenzation process
-ARGUMENT_MAP = {"X_COORD": 1, "Y_COORD": 2, "RADIUS": 3, "ANGLE": 4, "MAJOR_AXIS": 5, "RATIO": 6}
-# same here, text description of primitive type -> id
-PRIMITIVE_MAP = {"LINE": 1, "ARC": 2, "ELLIPSE": 3}
-
 # safe helper function to get fields from a dxf entity
 def _get_dxf_fields(entity, fields):
     dxf = getattr(entity, "dxf", None)
@@ -150,10 +162,11 @@ def line_to_attr(line):
     # get fields with check
     status, fields = _get_dxf_fields(line, ["start", "end"])
     if not status:
-        return 1, [], [], -100
-    
+        return 1, [], [], PRIMITIVE_MAP.get("ERROR")
+
     # build arg and arg_types
-    args = [*(fields["start"][:2]), *(fields["end"][:2])]
+    args = [fields["start"][0], fields["start"][1],
+            fields["end"][0], fields["end"][1]]
     arg_types = [ARGUMENT_MAP.get("X_COORD"), ARGUMENT_MAP.get("Y_COORD"), 
                  ARGUMENT_MAP.get("X_COORD"), ARGUMENT_MAP.get("Y_COORD")]
     return 0, args, arg_types, PRIMITIVE_MAP.get("LINE")
@@ -162,10 +175,13 @@ def arc_to_attr(arc):
     # get fields with check
     status, fields = _get_dxf_fields(arc, ["center", "radius", "start_angle", "end_angle"])
     if not status:
-        return 1, [], [], -100
+        return 1, [], [], PRIMITIVE_MAP.get("ERROR")
     
     # build outputs
-    args = [*(fields["center"][:2]), fields["radius"], fields["start_angle"], fields["end_angle"]]
+    args = [fields["center"][0], fields["center"][1],
+            fields["radius"],
+            fields["start_angle"],
+            fields["end_angle"]]
     arg_types = [ARGUMENT_MAP.get("X_COORD"), ARGUMENT_MAP.get("Y_COORD"),
                  ARGUMENT_MAP.get("RADIUS"),
                  ARGUMENT_MAP.get("ANGLE"),
@@ -176,19 +192,24 @@ def ellipse_to_attr(ellipse):
     # get fields with check
     status, fields = _get_dxf_fields(ellipse, ["center", "major_axis", "ratio", "start_param", "end_param"])
     if not status:
-        return 1, [], [], -100
+        return 1, [], [], PRIMITIVE_MAP.get("ERROR")
     
     # build outputs
-    args = [*(fields["center"][:2]), fields["major_axis"], fields["ratio"], fields["start_param"], fields["end_param"]]
+    args = [fields["center"][0], fields["center"][1],
+            abs(fields["major_axis"][0]),
+            abs(fields["major_axis"][0]) * fields["ratio"],
+            fields["start_param"],
+            fields["end_param"]]
     arg_types = [ARGUMENT_MAP.get("X_COORD"), ARGUMENT_MAP.get("Y_COORD"),
                  ARGUMENT_MAP.get("MAJOR_AXIS"),
-                 ARGUMENT_MAP.get("RATIO"),
+                 ARGUMENT_MAP.get("MINOR_AXIS"),
                  ARGUMENT_MAP.get("ANGLE"),
                  ARGUMENT_MAP.get("ANGLE")]  
     return 0, args, arg_types, PRIMITIVE_MAP.get("ELLIPSE")
 
+# not implemented yet
 def spline_to_attr(spline):
-    return 1, [], [], -100
+    return 1, [], [], PRIMITIVE_MAP.get("ERROR")
     # get fields with check
     status, fields = _get_dxf_fields(spline, ["center", "major_axis", "ratio", "start_param", "end_param"])
     if not status:
@@ -199,38 +220,80 @@ def spline_to_attr(spline):
     arg_types = []
     return 0, args, arg_types, PRIMITIVE_MAP.get("LINE")
 
-def polyline_to_attr(polyline):
-    return 1, [], [], -100
-    args = []
-    arg_types = []
-    return 0, args, arg_types, PRIMITIVE_MAP.get("LINE")
-
 def solid_to_attr(solid):
+    return 1, [], [], PRIMITIVE_MAP.get("ERROR")
     args = []
     arg_types = []
     return 0, args, arg_types, PRIMITIVE_MAP.get("LINE")
 
 def point_to_attr(point):
+    return 1, [], [], PRIMITIVE_MAP.get("ERROR")
     args = []
     arg_types = []
     return 0, args, arg_types, PRIMITIVE_MAP.get("LINE")
 
+# extract only text with valid dimension values
 def text_to_attr(text):
-    args = []
-    arg_types = []
-    return 0, args, arg_types, PRIMITIVE_MAP.get("LINE")
+    raise NotImplementedError("don't use it, text is encoded in a different way")
 
+def text_to_tensor(text, arg_vec_length, num_arg_types, num_prim_types):
+    return 1
+
+def primitive_to_attr(primitive, debug=False):
+    if not hasattr(primitive, "dxftype"):
+        if debug:
+            print("Primitive has no dxftype:", primitive)
+        return 1, [], [], PRIMITIVE_MAP.get("ERROR")
+    entity_type = primitive.dxftype()
+    if entity_type == "LINE":
+        return line_to_attr(primitive)
+    elif entity_type == "ARC":
+        return arc_to_attr(primitive)
+    elif entity_type == "ELLIPSE":
+        return ellipse_to_attr(primitive)
+    elif entity_type == "SPLINE":
+        return spline_to_attr(primitive)
+    elif entity_type == "SOLID":
+        return solid_to_attr(primitive)
+    elif entity_type == "POINT":
+        return point_to_attr(primitive)
+    else:
+        if debug:
+            print("Unable to handle dxf type in primitive_to_attr:", primitive.dxftype())
+        return 1, [], [], PRIMITIVE_MAP.get("ERROR")
+    
 # convert the attribute returned by previous functions to a tensor
-# 3 tensors: (arg_vec_length, 1) for normalized arguments
-#            (arg_vec_length, num_arg_types) for argument types (one hot vector)
+# 3 tensors: (1, arg_vec_length) for arguments
+#            (1, arg_vec_length, num_arg_types) for argument types (one hot vector)
 #            (1, num_prim_types) for primitive type (one hot vector)
-def attr_to_tensor(attr, arg_vec_length, num_arg_types, num_prim_types):
-    return 1
+# the 1 is for stacking
+def attr_to_tensor(args, arg_types, prim_type, arg_vec_length, num_arg_types, num_prim_types):
+    # fill in args and arg_types to fixed length
+    while len(args) < arg_vec_length:
+        args.append(-1)
+        arg_types.append(ARGUMENT_MAP.get("EMPTY"))
+    args_tensor = torch.tensor(args).unsqueeze(0)
+    arg_types_tensor = torch.nn.functional.one_hot(torch.tensor(arg_types), num_classes=num_arg_types).unsqueeze(0)
+    # prim_type here starts at 1 ("error" primitives can't reach here), so shift down by 1
+    prim_type_tensor = torch.nn.functional.one_hot(torch.tensor([prim_type - 1]), num_classes=num_prim_types)
+    return args_tensor, arg_types_tensor, prim_type_tensor
 
-def primitives_to_tensor(primitives):
-
+def primitives_to_tensor(primitives, arg_vec_length, num_arg_types, num_prim_types, debug=False):
+    args_list = []
+    arg_types_list = []
+    prim_types_list = []
     for primitive in primitives:
-        print(1)
-    return 1
+        # try converting primitive to attributes
+        status, args, arg_types, prim_type = primitive_to_attr(primitive, debug=debug)
+        if status:
+            if debug:
+                print("Skipping primitive_to_tensor function:", primitive)
+            continue
+        else:
+            args_tensor, arg_types_tensor, prim_type_tensor = attr_to_tensor(args, arg_types, prim_type, arg_vec_length, num_arg_types, num_prim_types)
+            args_list.append(args_tensor)
+            arg_types_list.append(arg_types_tensor)
+            prim_types_list.append(prim_type_tensor)
+    return torch.cat(args_list, dim=0), torch.cat(arg_types_list, dim=0), torch.cat(prim_types_list, dim=0)
 
     
